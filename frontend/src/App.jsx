@@ -1,32 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import mapboxgl from 'mapbox-gl'
 import 'mapbox-gl/dist/mapbox-gl.css'
+import { fetchInterventionCatalog } from './lib/interventionsApi'
 import './App.css'
 
 const DEFAULT_CENTER = [-97.7431, 30.2672]
 const INTERVENTION_SOURCE_ID = 'planned-interventions'
 const DROP_PREVIEW_SOURCE_ID = 'drop-preview'
-const LOCAL_ROAD_CLASSES = new Set(['street', 'street_limited', 'tertiary'])
-const BIKE_LANE_ALLOWED_CLASSES = new Set([
-  'street',
-  'street_limited',
-  'tertiary',
-  'secondary',
-  'primary',
-])
-
-const TOOL_OPTIONS = [
-  {
-    id: 'bike-lane',
-    label: 'Bike lane',
-    description: 'Drop onto a road to highlight that street segment as a proposed bike lane.',
-  },
-  {
-    id: 'crosswalk',
-    label: 'Crosswalk',
-    description: 'Drop onto a road to add a marked crossing aligned to the street direction.',
-  },
-]
 
 function createFeatureCollection(features) {
   return {
@@ -44,28 +24,24 @@ function getRoadClass(feature) {
   )
 }
 
-function getPlacementRules(toolId) {
-  if (toolId === 'crosswalk') {
-    return {
-      allowedClasses: LOCAL_ROAD_CLASSES,
-      blockedLabel: 'Crosswalks can only be placed on local roads, not highways or major arterials.',
-      emptyLabel: 'Drop the crosswalk on a local street.',
-    }
-  }
+function getPlacementRules(toolId, interventionCatalogById) {
+  const intervention = interventionCatalogById.get(toolId)
+  const placement = intervention?.placement ?? {}
 
   return {
-    allowedClasses: BIKE_LANE_ALLOWED_CLASSES,
-    blockedLabel: 'Bike lanes are limited to surface streets in this prototype.',
-    emptyLabel: 'Drop the bike lane on a road.',
+    allowedClasses: new Set(placement.allowedRoadClasses ?? []),
+    blockedLabel:
+      placement.blockedLabel ?? 'This intervention cannot be placed on the selected road.',
+    emptyLabel: placement.emptyLabel ?? 'Drop the intervention on a valid road.',
   }
 }
 
-function getRoadPlacementState(toolId, roadFeature) {
+function getRoadPlacementState(toolId, roadFeature, interventionCatalogById) {
   if (!toolId || !roadFeature) {
     return { isValid: false, roadClass: '', message: '' }
   }
 
-  const rules = getPlacementRules(toolId)
+  const rules = getPlacementRules(toolId, interventionCatalogById)
   const roadClass = getRoadClass(roadFeature)
   const isValid = rules.allowedClasses.has(roadClass)
 
@@ -239,6 +215,13 @@ function App() {
     createFeatureCollection([]),
   )
   const accessToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN
+  const [interventionCatalog, setInterventionCatalog] = useState([])
+  const [catalogStatus, setCatalogStatus] = useState('loading')
+  const [catalogError, setCatalogError] = useState('')
+  const interventionCatalogById = useMemo(
+    () => new Map(interventionCatalog.map((intervention) => [intervention.id, intervention])),
+    [interventionCatalog],
+  )
   const interventionSummary = useMemo(() => {
     const bikeLanes = interventions.filter(
       (feature) => feature.properties.interventionType === 'bike-lane',
@@ -249,6 +232,35 @@ function App() {
 
     return { bikeLanes, crosswalks }
   }, [interventions])
+
+  useEffect(() => {
+    const abortController = new AbortController()
+
+    async function loadInterventionCatalog() {
+      try {
+        setCatalogStatus('loading')
+        setCatalogError('')
+        const catalog = await fetchInterventionCatalog(abortController.signal)
+        setInterventionCatalog(catalog)
+        setCatalogStatus('ready')
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          return
+        }
+
+        setCatalogStatus('error')
+        setCatalogError(
+          'Could not load interventions from the backend. Start the backend to make the planner available.',
+        )
+      }
+    }
+
+    loadInterventionCatalog()
+
+    return () => {
+      abortController.abort()
+    }
+  }, [])
 
   useEffect(() => {
     if (!accessToken || !mapContainerRef.current || mapRef.current) {
@@ -418,11 +430,11 @@ function App() {
     if (!roadFeature) {
       setPreviewFeatureCollection(createFeatureCollection([]))
       setDropTargetState('idle')
-      setStatusMessage(getPlacementRules(toolId).emptyLabel)
+      setStatusMessage(getPlacementRules(toolId, interventionCatalogById).emptyLabel)
       return
     }
 
-    const placement = getRoadPlacementState(toolId, roadFeature)
+    const placement = getRoadPlacementState(toolId, roadFeature, interventionCatalogById)
     setPreviewFeatureCollection(createPreviewFeature(roadFeature, toolId, placement.isValid))
     setDropTargetState(placement.isValid ? 'valid' : 'invalid')
     setStatusMessage(placement.message)
@@ -442,7 +454,7 @@ function App() {
       return
     }
 
-    const placement = getRoadPlacementState(toolId, roadFeature)
+    const placement = getRoadPlacementState(toolId, roadFeature, interventionCatalogById)
 
     if (!placement.isValid) {
       setStatusMessage(placement.message)
@@ -476,7 +488,7 @@ function App() {
     setDraggingToolId(toolId)
     setDropTargetState('idle')
     setPreviewFeatureCollection(createFeatureCollection([]))
-    setStatusMessage(getPlacementRules(toolId).emptyLabel)
+    setStatusMessage(getPlacementRules(toolId, interventionCatalogById).emptyLabel)
   }
 
   function handleDrop(event) {
@@ -516,7 +528,7 @@ function App() {
     setPreviewFeatureCollection(createFeatureCollection([]))
 
     if (draggingToolId) {
-      setStatusMessage(getPlacementRules(draggingToolId).emptyLabel)
+      setStatusMessage(getPlacementRules(draggingToolId, interventionCatalogById).emptyLabel)
     }
   }
 
@@ -557,21 +569,27 @@ function App() {
 
         <div className="status-card">
           <h2>Drag interventions</h2>
-          <div className="tool-list">
-            {TOOL_OPTIONS.map((tool) => (
-              <button
-                key={tool.id}
-                type="button"
-                draggable
-                className={`tool-card ${draggingToolId === tool.id ? 'dragging' : ''}`}
-                onDragStart={(event) => handleDragStart(event, tool.id)}
-                onDragEnd={handleDragEnd}
-              >
-                <span className="tool-card-title">{tool.label}</span>
-                <span className="tool-card-description">{tool.description}</span>
-              </button>
-            ))}
-          </div>
+          {catalogStatus === 'loading' ? (
+            <p>Loading intervention catalog from the backend...</p>
+          ) : catalogStatus === 'error' ? (
+            <p>{catalogError}</p>
+          ) : (
+            <div className="tool-list">
+              {interventionCatalog.map((tool) => (
+                <button
+                  key={tool.id}
+                  type="button"
+                  draggable
+                  className={`tool-card ${draggingToolId === tool.id ? 'dragging' : ''}`}
+                  onDragStart={(event) => handleDragStart(event, tool.id)}
+                  onDragEnd={handleDragEnd}
+                >
+                  <span className="tool-card-title">{tool.label}</span>
+                  <span className="tool-card-description">{tool.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="status-card">
@@ -587,11 +605,11 @@ function App() {
         </div>
 
         <div className="status-card">
-          <h2>Next step</h2>
+          <h2>Architecture</h2>
           <p>
-            Once the drag-and-drop map feels right, the next layer can answer
-            questions like "What happens if we add a bike lane on South Congress?"
-            using backend analysis.
+            Intervention definitions now live in the backend catalog, so the frontend
+            reads the same labels and placement rules that your future analysis APIs
+            can use.
           </p>
         </div>
       </section>
@@ -617,7 +635,9 @@ function App() {
                 ? 'Crosswalks only snap to local streets. Highways and major roads are blocked.'
                 : draggingToolId === 'bike-lane'
                   ? 'Bike lanes can be dropped on eligible surface streets.'
-                  : 'Drop a bike lane or crosswalk card onto a road to add it to the plan.'}
+                  : catalogStatus === 'error'
+                    ? 'Start the backend to load intervention definitions for the planner.'
+                    : 'Drop a bike lane or crosswalk card onto a road to add it to the plan.'}
             </div>
           </>
         ) : (
